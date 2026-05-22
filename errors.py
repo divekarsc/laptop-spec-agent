@@ -6,7 +6,14 @@ from typing import Any
 
 
 class AgentError(Exception):
-    """Base error with a message safe to show in CLI and graph state."""
+    """Base exception with a message safe for CLI and graph state.
+
+    Attributes:
+        user_message: Primary text shown to the user.
+        hint: Optional remediation advice.
+        cause: Original exception, if any.
+        code: Machine-readable category string.
+    """
 
     code: str = "agent_error"
 
@@ -18,6 +25,14 @@ class AgentError(Exception):
         hint: str | None = None,
         cause: BaseException | None = None,
     ) -> None:
+        """Build an agent error.
+
+        Args:
+            user_message: Short description of what went wrong.
+            code: Optional override for ``self.code``.
+            hint: Optional extra guidance appended by ``formatted()``.
+            cause: Optional underlying exception for logging.
+        """
         self.user_message = user_message
         self.hint = hint
         self.cause = cause
@@ -27,39 +42,66 @@ class AgentError(Exception):
         super().__init__(detail)
 
     def formatted(self) -> str:
+        """Format this error for display or ``AgentState['error']``.
+
+        Returns:
+            ``user_message``, plus `` Hint: …`` when a hint is set and not
+            already contained in the message.
+        """
         if self.hint and self.hint not in self.user_message:
             return f"{self.user_message} Hint: {self.hint}"
         return self.user_message
 
 
 class ConfigurationError(AgentError):
+    """Missing or invalid environment configuration (e.g. API key)."""
+
     code = "configuration_error"
 
 
 class ValidationError(AgentError):
+    """Invalid CLI input such as URL or use-case text."""
+
     code = "validation_error"
 
 
 class ScrapeError(AgentError):
+    """Playwright failed to load or read the product page."""
+
     code = "scrape_error"
 
 
 class LLMError(AgentError):
+    """Gemini API or structured-output failure."""
+
     code = "llm_error"
 
 
 class SearchError(AgentError):
+    """DuckDuckGo search tool failure."""
+
     code = "search_error"
 
 
 _EXIT_HINT = "See logs/system.log for full stack traces."
 
-
 MAX_USE_CASE_WORDS = 25
 
 
 def validate_use_case(text: str) -> str:
-    """Return normalized use case text or raise ``ValidationError``."""
+    """Validate and normalize the user's laptop use-case description.
+
+    Collapses whitespace and enforces a 25-word maximum.
+
+    Args:
+        text: Raw use-case string from CLI flag or stdin.
+
+    Returns:
+        Normalized single-line use-case string.
+
+    Raises:
+        ValidationError: If empty or longer than ``MAX_USE_CASE_WORDS`` words.
+    """
     cleaned = " ".join((text or "").split())
     if not cleaned:
         raise ValidationError(
@@ -76,7 +118,17 @@ def validate_use_case(text: str) -> str:
 
 
 def validate_product_url(url: str) -> str:
-    """Return a normalized URL or raise ``ValidationError``."""
+    """Validate a retail product page URL.
+
+    Args:
+        url: URL string from the command line.
+
+    Returns:
+        Stripped URL starting with ``http://`` or ``https://``.
+
+    Raises:
+        ValidationError: If missing, wrong scheme, or longer than 2048 characters.
+    """
     cleaned = (url or "").strip()
     if not cleaned:
         raise ValidationError(
@@ -96,6 +148,14 @@ def validate_product_url(url: str) -> str:
 
 
 def _match_google_api_error(message: str) -> LLMError | None:
+    """Map Gemini error text to a typed ``LLMError``, if recognized.
+
+    Args:
+        message: String form of an API or SDK exception.
+
+    Returns:
+        ``LLMError`` with a specific ``code`` when matched; otherwise ``None``.
+    """
     lower = message.lower()
     if "api key" in lower or "api_key" in lower or "invalid key" in lower:
         return LLMError(
@@ -122,6 +182,14 @@ def _match_google_api_error(message: str) -> LLMError | None:
 
 
 def _match_playwright_error(exc: BaseException) -> ScrapeError:
+    """Map a Playwright exception to a ``ScrapeError`` with hints.
+
+    Args:
+        exc: Exception raised during ``page.goto`` or page evaluation.
+
+    Returns:
+        ``ScrapeError`` tailored to timeout, network, or missing browser.
+    """
     message = str(exc)
     lower = message.lower()
 
@@ -160,6 +228,15 @@ def _match_playwright_error(exc: BaseException) -> ScrapeError:
 
 
 def _match_search_error(exc: BaseException, *, query: str | None = None) -> SearchError:
+    """Map a search backend exception to ``SearchError``.
+
+    Args:
+        exc: Exception from DuckDuckGo / ``ddgs``.
+        query: Search query string, included in the message when provided.
+
+    Returns:
+        ``SearchError`` with optional query context in ``user_message``.
+    """
     message = str(exc)
     prefix = f'Web search failed for "{query}". ' if query else "Web search failed. "
     if "ddgs" in message.lower() or "duckduckgo" in message.lower():
@@ -181,7 +258,16 @@ def wrap_exception(
     phase: str,
     context: dict[str, Any] | None = None,
 ) -> AgentError:
-    """Map a raw exception to an ``AgentError`` with a useful user message."""
+    """Convert any exception into an ``AgentError`` for the current pipeline phase.
+
+    Args:
+        exc: Caught exception from a node or tool.
+        phase: Step name (e.g. ``extract_page``, ``parse_specs``, ``search``).
+        context: Optional dict with ``url`` or ``query`` for richer messages.
+
+    Returns:
+        Existing ``AgentError`` unchanged, or a new typed subclass with hints.
+    """
     if isinstance(exc, AgentError):
         return exc
 
@@ -198,7 +284,7 @@ def wrap_exception(
     if phase in ("search", "search_missing_specs"):
         return _match_search_error(exc, query=query)
 
-    if phase in ("llm", "parse_specs", "extract"):
+    if phase in ("llm", "parse_specs", "extract", "evaluate_use_case"):
         if mapped := _match_google_api_error(str(exc)):
             return mapped
         return LLMError(
@@ -223,12 +309,28 @@ def wrap_exception(
 
 
 def error_message_for_state(exc: BaseException, *, phase: str, **context: Any) -> str:
-    """Return a single string suitable for ``AgentState['error']``."""
+    """Produce a single error string for LangGraph state updates.
+
+    Args:
+        exc: Caught exception.
+        phase: Pipeline phase passed to ``wrap_exception``.
+        **context: Keyword arguments forwarded as ``context`` (e.g. ``url=``).
+
+    Returns:
+        Formatted user-facing error text.
+    """
     return wrap_exception(exc, phase=phase, context=context).formatted()
 
 
 def cli_exit_message(exc: BaseException) -> str:
-    """Format an exception for stderr when the CLI exits."""
+    """Format an exception for printing to stderr before CLI exit.
+
+    Args:
+        exc: Any exception raised during ``asyncio.run(_main())``.
+
+    Returns:
+        User-safe message; ``Interrupted.`` for keyboard interrupt.
+    """
     if isinstance(exc, AgentError):
         return exc.formatted()
     if isinstance(exc, KeyboardInterrupt):
@@ -238,6 +340,11 @@ def cli_exit_message(exc: BaseException) -> str:
 
 
 def missing_api_key_error() -> ConfigurationError:
+    """Build a standard error when no Gemini API key is configured.
+
+    Returns:
+        ``ConfigurationError`` with setup hint for ``.env``.
+    """
     return ConfigurationError(
         "No Google API key found.",
         hint=(
@@ -249,6 +356,11 @@ def missing_api_key_error() -> ConfigurationError:
 
 
 def empty_page_content_error() -> ValidationError:
+    """Build an error when scraped page text is too short to parse.
+
+    Returns:
+        ``ValidationError`` suggesting bot blocking or JS-only content.
+    """
     return ValidationError(
         "The scraped page contained no readable text.",
         hint="The site may block bots, require login, or load content via JavaScript only.",
@@ -257,7 +369,14 @@ def empty_page_content_error() -> ValidationError:
 
 
 def summarize_run_failure(state: dict[str, Any]) -> str:
-    """Build a CLI message when the agent ends in a failed state."""
+    """Describe why a finished agent state is considered a failure.
+
+    Args:
+        state: Final ``AgentState`` dict (or compatible mapping).
+
+    Returns:
+        Human-readable failure reason for CLI or logging.
+    """
     if error := state.get("error"):
         return str(error)
     if not state.get("specs"):

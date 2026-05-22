@@ -1,3 +1,5 @@
+"""LangGraph workflow, CLI, and streaming status for the laptop spec agent."""
+
 import argparse
 import asyncio
 import os
@@ -23,6 +25,7 @@ from errors import (
 )
 from llm_config import get_fit_evaluation_llm, get_gemini_model_name, get_structured_llm
 from logging_config import get_system_logger, get_user_logger, setup_logging
+from prompts import build_extract_specs_prompt, build_fit_evaluation_prompt
 from schema import LaptopSpecs, UseCaseFitEvaluation
 from state import AgentState
 from tools import fetch_page_text, search_web
@@ -49,12 +52,6 @@ _FIELD_SEARCH_LABELS: dict[str, str] = {
     "refresh_rate_hz": "refresh rate Hz",
 }
 
-_EXTRACT_PROMPT = """Extract laptop hardware specifications from the retail product page text below.
-Use only information present in the text; leave fields null when not stated or unclear.
-
-Page text:
-{content}"""
-
 _STREAM_MODES = ("updates", "custom", "values")
 
 _NODE_STATUS: dict[str, str] = {
@@ -63,22 +60,6 @@ _NODE_STATUS: dict[str, str] = {
     "search_missing_specs": "Searching the web for missing specs…",
     "evaluate_use_case": "Evaluating fit for your use case…",
 }
-
-_FIT_EVAL_PROMPT = """You are advising a laptop buyer. Given structured hardware specs and the user's use case, decide how well this laptop fits.
-
-Use case (user's words):
-{use_case}
-
-Laptop specs (JSON):
-{specs}
-
-Choose one recommendation:
-- recommended: strong fit for the use case
-- not_recommended: poor fit; important requirements likely unmet
-- compromise: workable with clear tradeoffs (battery, performance, screen, etc.)
-- insufficient_data: too many unknown specs to judge fairly
-
-Base your answer only on the specs and use case provided. Be concise in the rationale."""
 
 _RECOMMENDATION_LABELS = {
     "recommended": "Recommended",
@@ -89,7 +70,14 @@ _RECOMMENDATION_LABELS = {
 
 
 class AgentStatus(TypedDict):
-    """User-facing status event emitted while the graph runs."""
+    """User-facing status event emitted while the graph runs via ``astream``.
+
+    Attributes:
+        message: Human-readable progress or outcome text.
+        node: LangGraph node name when applicable.
+        phase: Coarse step (e.g. ``scrape``, ``extract``, ``fit``, ``done``).
+        final_state: Full ``AgentState`` on the terminal ``done`` event only.
+    """
 
     message: str
     node: NotRequired[str]
@@ -98,6 +86,16 @@ class AgentStatus(TypedDict):
 
 
 def _emit_status(message: str, *, node: str | None = None, phase: str | None = None) -> None:
+    """Push a progress message to LangGraph custom stream consumers.
+
+    Args:
+        message: Text shown on the console during streaming.
+        node: Optional graph node name for context.
+        phase: Optional phase label (``scrape``, ``search``, ``fit``, etc.).
+
+    Returns:
+        None. Silently no-ops when not executing inside a streaming graph.
+    """
     payload: dict[str, Any] = {"message": message}
     if node:
         payload["node"] = node
@@ -110,11 +108,29 @@ def _emit_status(message: str, *, node: str | None = None, phase: str | None = N
 
 
 def _initial_state(url: str, use_case: str) -> AgentState:
+    """Build the state dict passed to ``graph.ainvoke`` / ``graph.astream``.
+
+    Args:
+        url: Validated product page URL.
+        use_case: Validated use-case string (≤25 words).
+
+    Returns:
+        ``AgentState`` with ``retry_count`` 0 and empty ``error``.
+    """
     return {"url": url, "use_case": use_case, "error": "", "retry_count": 0}
 
 
 def prompt_use_case_interactive() -> str:
-    """Read a use case from stdin (max 25 words)."""
+    """Read and validate a use case from stdin.
+
+    Prints a prompt, reads one line, and enforces the 25-word limit.
+
+    Returns:
+        Normalized use-case string.
+
+    Raises:
+        ValidationError: If input is empty or too long.
+    """
     print(
         f"\nDescribe your laptop use case in {MAX_USE_CASE_WORDS} words or fewer, "
         "then press Enter:"
@@ -123,19 +139,44 @@ def prompt_use_case_interactive() -> str:
 
 
 def resolve_use_case(cli_value: str | None) -> str:
-    """Use --use-case flag or prompt interactively."""
+    """Obtain use case from CLI flag or interactive prompt.
+
+    Args:
+        cli_value: Value of ``--use-case`` if provided; ``None`` triggers prompt.
+
+    Returns:
+        Validated use-case string.
+    """
     if cli_value is not None:
         return validate_use_case(cli_value)
     return prompt_use_case_interactive()
 
 
 def _format_search_query(model_name: str | None, field_name: str) -> str:
+    """Build a DuckDuckGo query for one missing spec field.
+
+    Args:
+        model_name: Laptop model from parsed specs, or ``None`` for generic ``laptop``.
+        field_name: ``LaptopSpecs`` attribute name (e.g. ``npu_tops``).
+
+    Returns:
+        Query string such as ``"Dell XPS 13 NPU TOPS specs"``.
+    """
     label = _FIELD_SEARCH_LABELS.get(field_name, field_name.replace("_", " "))
     product = (model_name or "laptop").strip()
     return f"{product} {label} specs"
 
 
 async def extract_page_node(state: AgentState) -> dict:
+    """LangGraph node: scrape product page text into ``raw_content``.
+
+    Args:
+        state: Current graph state; uses ``state['url']``.
+
+    Returns:
+        Partial update with ``raw_content`` on success, or ``error`` message.
+        Empty dict if a prior error already exists.
+    """
     if state.get("error"):
         system_log.debug("extract_page_node skipped: prior error=%s", state["error"])
         return {}
@@ -167,6 +208,15 @@ async def extract_page_node(state: AgentState) -> dict:
 
 
 async def parse_specs_node(state: AgentState) -> dict:
+    """LangGraph node: extract ``LaptopSpecs`` from ``raw_content`` via Gemini.
+
+    Args:
+        state: Must include non-empty ``raw_content`` unless ``error`` is set.
+
+    Returns:
+        Partial update with ``specs`` on success, or ``error`` on failure.
+        Empty dict if skipped due to prior error.
+    """
     if state.get("error"):
         system_log.debug("parse_specs_node skipped: error=%s", state["error"])
         return {}
@@ -200,8 +250,8 @@ async def parse_specs_node(state: AgentState) -> dict:
         specs = await get_structured_llm().ainvoke(
             [
                 HumanMessage(
-                    content=_EXTRACT_PROMPT.format(
-                        content=raw_content[:_CONTENT_LIMIT],
+                    content=build_extract_specs_prompt(
+                        raw_content[:_CONTENT_LIMIT],
                     ),
                 ),
             ],
@@ -232,6 +282,16 @@ async def parse_specs_node(state: AgentState) -> dict:
 
 
 async def search_missing_specs_node(state: AgentState) -> dict:
+    """LangGraph node: web-search each null spec field and enrich ``raw_content``.
+
+    Args:
+        state: Requires ``specs`` with ``unknown_fields``; reads ``retry_count``.
+
+    Returns:
+        Partial update with longer ``raw_content``, incremented ``retry_count``,
+        and cleared ``error`` on success. Per-field search failures are appended
+        as text rather than aborting the whole node.
+    """
     if state.get("error"):
         system_log.debug("search_missing_specs_node skipped: error=%s", state["error"])
         return {}
@@ -319,6 +379,15 @@ async def search_missing_specs_node(state: AgentState) -> dict:
 
 
 def route_after_parse(state: AgentState) -> str:
+    """Conditional edge: search loop vs use-case evaluation.
+
+    Args:
+        state: Post-parse state including ``specs`` and ``retry_count``.
+
+    Returns:
+        ``"search_missing_specs"`` when null fields remain and retries < 2;
+        otherwise ``"evaluate_use_case"``.
+    """
     if state.get("error"):
         system_log.info("route_after_parse -> evaluate_use_case (prior error)")
         return "evaluate_use_case"
@@ -346,6 +415,15 @@ def route_after_parse(state: AgentState) -> str:
 
 
 async def evaluate_use_case_node(state: AgentState) -> dict:
+    """LangGraph node: judge fit between ``specs`` and ``use_case``.
+
+    Args:
+        state: Needs ``use_case`` and ``specs``; no-ops if ``error`` already set.
+
+    Returns:
+        Partial update with ``fit_evaluation`` (recommendation + rationale),
+        or ``error`` if evaluation cannot run or Gemini fails.
+    """
     if state.get("error"):
         system_log.debug(
             "evaluate_use_case_node skipped: prior error=%s",
@@ -381,9 +459,9 @@ async def evaluate_use_case_node(state: AgentState) -> dict:
         evaluation = await get_fit_evaluation_llm().ainvoke(
             [
                 HumanMessage(
-                    content=_FIT_EVAL_PROMPT.format(
+                    content=build_fit_evaluation_prompt(
                         use_case=use_case,
-                        specs=specs.model_dump_json(indent=2),
+                        specs_json=specs.model_dump_json(indent=2),
                     ),
                 ),
             ],
@@ -412,6 +490,11 @@ async def evaluate_use_case_node(state: AgentState) -> dict:
 
 
 def build_graph():
+    """Compile the laptop spec LangGraph with scrape, parse, search, and fit nodes.
+
+    Returns:
+        Compiled graph runnable via ``ainvoke`` / ``astream``.
+    """
     workflow = StateGraph(AgentState)
     workflow.add_node("extract_page", extract_page_node)
     workflow.add_node("parse_specs", parse_specs_node)
@@ -433,6 +516,14 @@ def build_graph():
 
 
 def _status_from_custom(payload: Any) -> AgentStatus | None:
+    """Convert a custom stream chunk to ``AgentStatus``.
+
+    Args:
+        payload: Dict from ``get_stream_writer()`` or a plain string.
+
+    Returns:
+        ``AgentStatus`` when payload is usable; otherwise ``None``.
+    """
     if isinstance(payload, dict) and payload.get("message"):
         status: AgentStatus = {"message": str(payload["message"])}
         if node := payload.get("node"):
@@ -446,6 +537,16 @@ def _status_from_custom(payload: Any) -> AgentStatus | None:
 
 
 def _status_from_node_update(node: str, update: dict[str, Any] | None) -> AgentStatus | None:
+    """Convert an ``updates`` stream chunk for one node to ``AgentStatus``.
+
+    Args:
+        node: LangGraph node name (e.g. ``parse_specs``).
+        update: State partial returned by that node, or ``None``.
+
+    Returns:
+        ``AgentStatus`` for errors, parse summaries, or fit results; ``None`` if
+        nothing user-facing should be logged.
+    """
     if not update:
         return None
 
@@ -478,6 +579,14 @@ def _status_from_node_update(node: str, update: dict[str, Any] | None) -> AgentS
 
 
 def _log_status(status: AgentStatus) -> None:
+    """Write a status event to user and system loggers.
+
+    Args:
+        status: Event from streaming helpers.
+
+    Returns:
+        None.
+    """
     user_log.info("%s", status["message"])
     system_log.debug(
         "stream status node=%s phase=%s message=%s",
@@ -488,7 +597,19 @@ def _log_status(status: AgentStatus) -> None:
 
 
 async def stream_agent(url: str, use_case: str) -> AsyncIterator[AgentStatus]:
-    """Yield user-facing status events while the graph runs via ``astream``."""
+    """Run the graph and yield progress events for each ``astream`` chunk.
+
+    Args:
+        url: Product page URL.
+        use_case: Validated user use-case description.
+
+    Yields:
+        ``AgentStatus`` events during execution; final yield has ``phase='done'``
+        and ``final_state`` set.
+
+    Returns:
+        Nothing directly; consumers read the last yielded ``final_state``.
+    """
     graph = build_graph()
     final_state: AgentState | None = None
 
@@ -589,7 +710,18 @@ async def stream_agent(url: str, use_case: str) -> AsyncIterator[AgentStatus]:
 
 
 async def run_agent(url: str, use_case: str) -> AgentState:
-    """Run the agent, streaming status via ``astream``, and return the final state."""
+    """Execute the full agent pipeline and return the terminal state.
+
+    Logs progress to the console via ``stream_agent``.
+
+    Args:
+        url: Product page URL.
+        use_case: User use-case string.
+
+    Returns:
+        Final ``AgentState`` including ``specs`` and ``fit_evaluation`` when
+        successful.
+    """
     result: AgentState | None = None
     async for status in stream_agent(url, use_case):
         if status.get("phase") == "done":
@@ -598,6 +730,14 @@ async def run_agent(url: str, use_case: str) -> AgentState:
 
 
 def _print_fit_evaluation(evaluation: UseCaseFitEvaluation) -> None:
+    """Print human-readable and JSON fit evaluation to stdout.
+
+    Args:
+        evaluation: Structured fit result from ``evaluate_use_case_node``.
+
+    Returns:
+        None.
+    """
     label = _RECOMMENDATION_LABELS.get(
         evaluation.recommendation,
         evaluation.recommendation,
@@ -609,6 +749,11 @@ def _print_fit_evaluation(evaluation: UseCaseFitEvaluation) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the CLI entrypoint.
+
+    Returns:
+        Namespace with ``url`` and optional ``use_case`` attributes.
+    """
     parser = argparse.ArgumentParser(
         description="Extract laptop hardware specs from a retail product page.",
     )
@@ -628,6 +773,15 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _exit_cli(message: str, *, code: int) -> None:
+    """Print an error to stderr and terminate the process.
+
+    Args:
+        message: User-facing error text.
+        code: Unix exit code (e.g. 1 runtime, 2 validation, 130 interrupt).
+
+    Returns:
+        Does not return; calls ``sys.exit``.
+    """
     print(f"Error: {message}", file=sys.stderr)
     sys.exit(code)
 

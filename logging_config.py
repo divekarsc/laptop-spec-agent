@@ -16,7 +16,17 @@ _CONFIGURED = False
 
 
 def setup_logging() -> tuple[logging.Logger, logging.Logger]:
-    """Configure user (console) and system (file) loggers. Idempotent."""
+    """Configure console and file loggers for the agent (idempotent).
+
+    Creates ``logs/system.log`` with rotation. User logger prints plain messages
+    to stdout; system logger records debug detail with timestamps.
+
+    Returns:
+        Tuple of ``(user_logger, system_logger)``.
+
+    Side effects:
+        Attaches handlers on first call; later calls return existing loggers.
+    """
     global _CONFIGURED
 
     user_logger = logging.getLogger(_USER_LOGGER_NAME)
@@ -61,10 +71,22 @@ def setup_logging() -> tuple[logging.Logger, logging.Logger]:
 
 
 def get_user_logger() -> logging.Logger:
+    """Return the logger used for concise progress messages on stdout.
+
+    Returns:
+        Logger named ``laptop_spec_agent.user`` (handlers configured via
+        ``setup_logging``).
+    """
     setup_logging()
     return logging.getLogger(_USER_LOGGER_NAME)
 
 
 def get_system_logger() -> logging.Logger:
+    """Return the logger used for detailed traces in ``logs/system.log``.
+
+    Returns:
+        Logger named ``laptop_spec_agent.system`` (handlers configured via
+        ``setup_logging``).
+    """
     setup_logging()
     return logging.getLogger(_SYSTEM_LOGGER_NAME)

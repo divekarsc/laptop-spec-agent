@@ -1,3 +1,5 @@
+"""Pydantic models for extracted laptop specs and use-case fit evaluation."""
+
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -8,10 +10,15 @@ FitRecommendation = Literal[
     "compromise",
     "insufficient_data",
 ]
+"""Allowed fit outcomes produced by the evaluate_use_case node."""
 
 
 class LaptopSpecs(BaseModel):
-    """Structured laptop hardware specifications extracted from retail pages."""
+    """Structured laptop hardware specifications extracted from retail pages.
+
+    All fields are optional because retail copy may omit values; null fields
+    trigger the web-search retry loop via ``unknown_fields``.
+    """
 
     model_name: Optional[str] = Field(
         default=None,
@@ -44,12 +51,23 @@ class LaptopSpecs(BaseModel):
 
     @property
     def unknown_fields(self) -> list[str]:
-        """Field names that are still null after extraction."""
+        """Return schema field names that are still null.
+
+        Returns:
+            List of attribute names (e.g. ``npu_tops``) with value ``None``.
+            Empty when every field is populated.
+        """
         return [name for name, value in self.model_dump().items() if value is None]
 
 
 class UseCaseFitEvaluation(BaseModel):
-    """Whether the laptop meets the user's stated use case."""
+    """Gemini judgment of how well laptop specs match the user's use case.
+
+    Attributes:
+        recommendation: One of ``recommended``, ``not_recommended``,
+            ``compromise``, or ``insufficient_data``.
+        rationale: Short explanation referencing specs and use case.
+    """
 
     recommendation: FitRecommendation = Field(
         description=(

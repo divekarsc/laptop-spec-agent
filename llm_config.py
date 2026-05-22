@@ -1,4 +1,4 @@
-"""LLM setup for structured spec extraction via Google Gemini."""
+"""LLM setup for structured spec extraction and use-case fit evaluation via Gemini."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from errors import ConfigurationError, LLMError, missing_api_key_error, wrap_exception
+from errors import ConfigurationError, missing_api_key_error, wrap_exception
 from logging_config import get_system_logger, get_user_logger
 from schema import LaptopSpecs, UseCaseFitEvaluation
 
@@ -20,6 +20,16 @@ _fit_evaluation_llm = None
 
 
 def _resolve_google_api_key() -> str:
+    """Read a Gemini API key from environment variables.
+
+    Checks ``GOOGLE_API_KEY`` then ``GEMINI_API_KEY``.
+
+    Returns:
+        Non-empty API key string.
+
+    Raises:
+        ConfigurationError: If neither variable is set.
+    """
     for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
         value = os.getenv(name, "").strip()
         if value:
@@ -29,11 +39,24 @@ def _resolve_google_api_key() -> str:
 
 
 def get_gemini_model_name() -> str:
+    """Return the Gemini model id used for all LLM calls.
+
+    Returns:
+        Value of ``GEMINI_MODEL`` env var, or ``DEFAULT_GEMINI_MODEL``.
+    """
     return os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
 
 def build_structured_llm():
-    """Build the structured-output Gemini runnable; raises ``ConfigurationError`` if misconfigured."""
+    """Create a Gemini runnable that returns ``LaptopSpecs`` via structured output.
+
+    Returns:
+        LangChain runnable: invoke with messages, get ``LaptopSpecs`` instance.
+
+    Raises:
+        ConfigurationError: When API key is missing.
+        AgentError: When client construction fails (via ``wrap_exception``).
+    """
     try:
         api_key = _resolve_google_api_key()
         model = get_gemini_model_name()
@@ -54,7 +77,14 @@ def build_structured_llm():
 
 
 def get_structured_llm():
-    """Lazy singleton for the structured LLM."""
+    """Return a cached structured-output LLM for spec parsing.
+
+    Returns:
+        Same runnable as ``build_structured_llm()`` (singleton per process).
+
+    Raises:
+        ConfigurationError: On first call if API key is missing.
+    """
     global _structured_llm
     if _structured_llm is None:
         _structured_llm = build_structured_llm()
@@ -62,7 +92,15 @@ def get_structured_llm():
 
 
 def build_fit_evaluation_llm():
-    """Structured LLM for use-case fit assessment."""
+    """Create a Gemini runnable that returns ``UseCaseFitEvaluation``.
+
+    Returns:
+        LangChain runnable: invoke with messages, get ``UseCaseFitEvaluation``.
+
+    Raises:
+        ConfigurationError: When API key is missing.
+        AgentError: When client construction fails (via ``wrap_exception``).
+    """
     try:
         api_key = _resolve_google_api_key()
         model = get_gemini_model_name()
@@ -81,7 +119,14 @@ def build_fit_evaluation_llm():
 
 
 def get_fit_evaluation_llm():
-    """Lazy singleton for fit evaluation."""
+    """Return a cached structured-output LLM for use-case fit evaluation.
+
+    Returns:
+        Same runnable as ``build_fit_evaluation_llm()`` (singleton per process).
+
+    Raises:
+        ConfigurationError: On first call if API key is missing.
+    """
     global _fit_evaluation_llm
     if _fit_evaluation_llm is None:
         _fit_evaluation_llm = build_fit_evaluation_llm()

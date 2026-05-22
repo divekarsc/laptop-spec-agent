@@ -1,3 +1,5 @@
+"""Async LangChain tools for web scraping and specification search."""
+
 import asyncio
 import os
 import time
@@ -27,7 +29,20 @@ _ddg_search = DuckDuckGoSearchRun()
 
 @tool
 async def search_web(query: str) -> str:
-    """Search the web for laptop specification information."""
+    """Search the web for laptop specification information via DuckDuckGo.
+
+    Runs the sync DuckDuckGo client in a thread pool so the event loop stays free.
+
+    Args:
+        query: Natural-language search string (e.g. ``"Dell XPS 13 NPU TOPS specs"``).
+
+    Returns:
+        Opaque text blob of search results for appending to ``raw_content``.
+
+    Raises:
+        SearchError: Empty query, empty results, or backend failure.
+        AgentError: Other failures wrapped with phase ``search``.
+    """
     cleaned = (query or "").strip()
     if not cleaned:
         raise SearchError(
@@ -60,7 +75,22 @@ async def search_web(query: str) -> str:
 
 @tool
 async def fetch_page_text(url: str) -> str:
-    """Load a retail product page and return visible body text."""
+    """Load a retail product page and return visible body text.
+
+    Launches headless Chromium, navigates to ``url``, and reads
+    ``document.body.innerText``.
+
+    Args:
+        url: HTTP(S) product page URL (already validated by the CLI).
+
+    Returns:
+        Plain-text page content for LLM extraction.
+
+    Raises:
+        ScrapeError: Playwright timeout, network error, or missing browser.
+        ValidationError: Fewer than ``_MIN_PAGE_CHARS`` characters scraped.
+        AgentError: Other failures wrapped with phase ``scrape``.
+    """
     timeout_ms = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", str(_DEFAULT_TIMEOUT_MS)))
     wait_until = os.getenv("PLAYWRIGHT_WAIT_UNTIL", _DEFAULT_WAIT_UNTIL)
 

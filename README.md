@@ -139,6 +139,7 @@ Rectangles are processing steps, diamonds are decisions, and rounded terminals a
 | File | Role |
 |------|------|
 | `graph.py` | LangGraph workflow, CLI, streaming status |
+| `prompts/` | LLM prompt templates (`spec_extraction`, `use_case_fit`) |
 | `schema.py` | `LaptopSpecs` Pydantic model |
 | `state.py` | `AgentState` TypedDict |
 | `tools.py` | Async Playwright scrape + DuckDuckGo search tools |
@@ -352,6 +353,8 @@ uv run python graph.py --help
 | `tests/test_errors.py` | URL/use-case validation, exception mapping |
 | `tests/test_schema.py` | `LaptopSpecs.unknown_fields`, fit model |
 | `tests/test_graph.py` | Router, search queries, graph nodes, status helpers |
+| `tests/test_prompts.py` | Prompt builder formatting |
+
 
 Integration tests (live Playwright, Gemini, DuckDuckGo) are not included so CI stays fast and credential-free.
 
