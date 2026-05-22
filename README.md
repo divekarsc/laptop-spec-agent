@@ -335,12 +335,25 @@ See `logs/system.log` for full stack traces.
 ## Development
 
 ```bash
-# Run tests / smoke import
+# Unit tests (no API key, browser, or network required)
+uv run pytest
+
+# Smoke import
 uv run python -c "from graph import build_graph; build_graph()"
 
 # Help
 uv run python graph.py --help
 ```
+
+### Tests
+
+| File | Covers |
+|------|--------|
+| `tests/test_errors.py` | URL/use-case validation, exception mapping |
+| `tests/test_schema.py` | `LaptopSpecs.unknown_fields`, fit model |
+| `tests/test_graph.py` | Router, search queries, graph nodes, status helpers |
+
+Integration tests (live Playwright, Gemini, DuckDuckGo) are not included so CI stays fast and credential-free.
 
 ### Design constraints (`.cursorrules`)
 
