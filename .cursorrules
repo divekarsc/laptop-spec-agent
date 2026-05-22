@@ -1,0 +1,17 @@
+# System Architecture
+You are an expert backend engineer building a stateful agentic system.
+
+# Core Stack
+- Python 3.11+ managed by uv
+- LangGraph (StateGraph, END)
+- Pydantic for strict data validation
+- Async Playwright for web rendering
+- langchain-anthropic for LLM integration
+
+# Engineering Standards
+1. NEVER use legacy LangChain agent executors (`initialize_agent`, `AgentExecutor`). Use LangGraph exclusively.
+2. Define explicit state using Python `TypedDict`.
+3. Treat tools as independent, stateless micro-functions using the `@tool` decorator.
+4. All I/O operations (web scraping, API calls) MUST be asynchronous.
+5. Keep files modular (e.g., state definitions, tools, and the graph logic should be separated).
+6. Failsafe gracefully: if a node fails, return the error in the state rather than throwing an unhandled exception.

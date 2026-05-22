@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets (use .env.example as a template)
+.env
+
+# Runtime logs (directory kept via logs/.gitkeep)
+logs/*.log
+logs/*.log.*
