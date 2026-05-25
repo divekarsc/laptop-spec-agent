@@ -5,6 +5,7 @@ from graph import (
     _status_from_custom,
     _status_from_node_update,
     build_graph,
+    route_after_check_cache,
     route_after_parse,
 )
 
@@ -23,6 +24,18 @@ class TestFormatSearchQuery:
     def test_fallback_product_name(self) -> None:
         q = _format_search_query(None, "refresh_rate_hz")
         assert q == "laptop refresh rate Hz specs"
+
+
+class TestRouteAfterCheckCache:
+    def test_cache_hit_skips_scrape_and_goes_to_fit(self) -> None:
+        state = _state(
+            specs=LaptopSpecs(model_name="X", slug_id="x"),
+            retry_count=0,
+        )
+        assert route_after_check_cache(state) == "evaluate_use_case"
+
+    def test_cache_miss_routes_to_extract(self) -> None:
+        assert route_after_check_cache(_state()) == "extract_page"
 
 
 class TestRouteAfterParse:
@@ -50,6 +63,11 @@ class TestRouteAfterParse:
                 tdp_watts=15.0,
                 gan_charging_support=False,
                 refresh_rate_hz=60,
+                weight_kg=1.5,
+                screen_size_inches=15.6,
+                battery_capacity_wh=60,
+                operating_system="Windows 11",
+                gpu_type="dedicated",
             ),
             retry_count=0,
         )
@@ -96,8 +114,10 @@ class TestBuildGraph:
         graph = build_graph()
         node_names = {n for n in graph.get_graph().nodes if not n.startswith("__")}
         assert node_names == {
+            "check_cache",
             "extract_page",
             "parse_specs",
+            "save_to_cache",
             "search_missing_specs",
             "evaluate_use_case",
         }

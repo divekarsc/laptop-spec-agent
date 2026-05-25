@@ -1,19 +1,21 @@
 # Laptop Spec Agent
 
-A LangGraph agent that extracts structured laptop hardware specifications from retail product pages. It scrapes the page with Playwright, parses specs with Google Gemini, and optionally fills gaps using DuckDuckGo web search before returning validated JSON.
+A LangGraph agent that extracts structured laptop hardware specifications from retail product pages. It checks a **SQLite cache** (via MCP) for known laptops, scrapes with Playwright when needed, parses specs with Google Gemini, fills gaps with DuckDuckGo search, persists results for **cross-retailer identity aliasing**, and evaluates fit against your use case.
 
 ## What it does
 
 Given a product URL (e.g. Lenovo, Dell, HP), the agent:
 
-1. **Scrapes** visible page text with headless Chromium.
-2. **Extracts** specs into a strict Pydantic schema via Gemini structured output.
-3. **Validates** which fields are still missing (`unknown_fields`).
-4. **Searches** the web for missing fields (up to 2 retry rounds).
-5. **Re-parses** enriched content until specs are complete or retries are exhausted.
-6. **Evaluates fit** against your stated use case (recommended / not recommended / compromise / insufficient data).
+1. **Checks cache** — looks up the URL, then a fast MPN/SKU extracted from the URL, in SQLite (`url_mapping` / `mpn_mapping`).
+2. **On cache hit** — loads cached specs and skips scraping; goes straight to fit evaluation.
+3. **On cache miss** — **scrapes** visible page text with headless Chromium.
+4. **Extracts** specs into a strict Pydantic schema via Gemini structured output (including weight, screen size, battery Wh, OS, GPU type).
+5. **Saves to cache** — writes the `laptops` row plus URL and MPN alias rows.
+6. **Validates** which fields are still missing (`unknown_fields`).
+7. **Searches** the web for missing fields (up to 2 retry rounds) and re-parses enriched content.
+8. **Evaluates fit** against your stated use case (recommended / not recommended / compromise / insufficient data).
 
-Output is laptop specs JSON plus a use-case fit evaluation.
+Output is laptop specs JSON plus a use-case fit evaluation. Repeat visits to the same product (or the same MPN on another retailer) can reuse cached specs.
 
 ### Extracted fields
 
@@ -26,132 +28,97 @@ Output is laptop specs JSON plus a use-case fit evaluation.
 | `tdp_watts` | number | Thermal design power (watts) |
 | `gan_charging_support` | boolean | GaN fast charging supported or included |
 | `refresh_rate_hz` | integer | Display refresh rate (Hz) |
+| `weight_kg` | number | Laptop weight (kg) |
+| `screen_size_inches` | number | Diagonal screen size (inches) |
+| `battery_capacity_wh` | integer | Battery capacity (Wh) |
+| `operating_system` | string | Preinstalled OS |
+| `gpu_type` | string | `dedicated`, `integrated`, or `hybrid` |
+| `slug_id` | string | Stable cross-retailer identity key (set at extract time) |
+| `part_number_mpn` | string | Manufacturer part number / SKU when known |
 
-Fields not found on the page or in search results remain `null`. The CLI may exit successfully with a **partial** result and log which fields are still missing.
+Fields not found on the page or in search results remain `null`. The CLI may exit successfully with a **partial** result and log which fields are still missing. Identity fields (`slug_id`, `part_number_mpn`) do not count toward `unknown_fields` for the search loop.
 
 ## Architecture
 
-### Flowchart
+### LangGraph flow (agent nodes)
 
-> **Preview in Cursor / VS Code:** the built-in Markdown preview does **not** render Mermaid unless you install an extension (e.g. [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid)). **GitHub** renders the diagram below automatically when you view this file on github.com. You can also paste the Mermaid block into [mermaid.live](https://mermaid.live).
+> **Preview in Cursor / VS Code:** install [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid) to render diagrams locally. **GitHub** renders Mermaid on github.com. Paste blocks into [mermaid.live](https://mermaid.live) if needed.
 
 ```mermaid
 flowchart TD
-    A([Start]) --> B[Read product URL from command line]
-    B --> C{URL starts with http:// or https://?}
-    C -->|No| D([Exit 2: invalid URL])
-    C -->|Yes| E[Read use case: prompt or --use-case flag]
-    E --> F{Use case empty or over 25 words?}
-    F -->|Yes| G([Exit 2: invalid use case])
-    F -->|No| H[Create AgentState with url and use_case]
-
-    H --> I[Scrape product page — extract_page / Playwright]
-    I --> J{Scrape succeeded?}
-    J -->|No| K[Store error in state]
-    J -->|Yes| L[Extract specs — parse_specs / Gemini]
-
-    L --> M{Parsing succeeded?}
-    M -->|No| K
-    M -->|Yes| N{Any spec fields still null AND retry_count less than 2?}
-    N -->|Yes| O[Search web for each missing field — search_missing_specs]
-    O --> P[Append results to raw_content, increment retry_count]
-    P --> L
-    N -->|No| Q[Evaluate fit for use case — evaluate_use_case / Gemini]
-
-    K --> Q
-    Q --> R{Evaluation ran and state has no new error?}
-    R -->|No| S([Exit 1: print error])
-    R -->|Yes| T[Print laptop specs JSON]
-    T --> U[Print recommendation: recommended, not recommended, compromise, or insufficient data]
-    U --> V([End])
+    START([START]) --> CACHE[check_cache — SQLite via MCP]
+    CACHE --> HIT{Specs found in cache?}
+    HIT -->|Yes| FIT[evaluate_use_case — Gemini]
+    HIT -->|No| SCRAPE[extract_page — Playwright]
+    SCRAPE --> PARSE[parse_specs — Gemini structured output]
+    PARSE --> SAVE[save_to_cache — SQLite via MCP]
+    SAVE --> LOOP{unknown_fields AND retry_count less than 2?}
+    LOOP -->|Yes| SEARCH[search_missing_specs — DuckDuckGo]
+    SEARCH --> PARSE
+    LOOP -->|No| FIT
+    FIT --> END([END])
 ```
 
-Rectangles are processing steps, diamonds are decisions, and rounded terminals are start/end. The search loop runs at most twice (`retry_count` 0 → 1 → 2). After retrieval finishes or fails, control always reaches **Evaluate fit** before exit.
+Each run opens an MCP stdio session to **`mcp-server-sqlite`** (default: `uvx mcp-server-sqlite --db-path data/laptop_cache.db`). Cache lookup failures are non-fatal: the agent falls back to scraping.
 
-**Plain-text version** (visible in any Markdown preview):
+### End-to-end flow (CLI + graph)
 
+```mermaid
+flowchart TD
+    A([CLI Start]) --> B[Validate URL and use case]
+    B --> C{Valid?}
+    C -->|No| D([Exit 2])
+    C -->|Yes| G[Open MCP SQLite session + init tables]
+    G --> CACHE[check_cache]
+    CACHE --> HIT{Cache hit?}
+    HIT -->|Yes| FIT[evaluate_use_case]
+    HIT -->|No| SCRAPE[extract_page]
+    SCRAPE --> PARSE[parse_specs]
+    PARSE --> SAVE[save_to_cache]
+    SAVE --> LOOP{Missing fields and retries left?}
+    LOOP -->|Yes| SEARCH[search_missing_specs]
+    SEARCH --> PARSE
+    LOOP -->|No| FIT
+    FIT --> OUT[Print specs JSON + fit recommendation]
+    OUT --> Z([Exit 0 or 1])
 ```
-                              ┌─────────┐
-                              │  Start  │
-                              └────┬────┘
-                                   ▼
-                    ┌──────────────────────────────┐
-                    │ Read URL from command line   │
-                    └──────────────┬───────────────┘
-                                   ▼
-                         ┌─────────────────┐
-                    No   │ Valid http(s)   │ Yes
-              ┌──────────│     URL?        │──────────┐
-              ▼          └─────────────────┘          ▼
-        ┌──────────┐                         ┌─────────────────┐
-        │ Exit (2) │                         │ Read use case   │
-        └──────────┘                         │ (≤ 25 words)    │
-                                             └────────┬────────┘
-                                                      ▼
-                                            ┌─────────────────┐
-                                            │ Init AgentState │
-                                            └────────┬────────┘
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Scrape page     │
-                                            │ (Playwright)    │
-                                            └────────┬────────┘
-                                                     ▼
-                                              ┌─────────────┐
-                                         No   │ Scrape OK?  │ Yes
-                                    ┌─────────│             │─────────┐
-                                    ▼         └─────────────┘         ▼
-                              ┌──────────┐                  ┌─────────────────┐
-                              │Set error │                  │ Parse specs     │
-                              └────┬─────┘                  │ (Gemini)        │
-                                   │                        └────────┬────────┘
-                                   │                                 ▼
-                                   │                          ┌─────────────┐
-                                   │                     No   │ Parse OK?   │ Yes
-                                   │                ┌─────────│             │─────────┐
-                                   │                ▼         └─────────────┘         ▼
-                                   │          ┌──────────┐              ┌──────────────────────┐
-                                   │          │Set error │         No   │ Missing fields AND   │ Yes
-                                   │          └────┬─────┘    ┌───────│ retry_count < 2 ?    │───────┐
-                                   │               │          │       └──────────────────────┘       │
-                                   │               │          ▼                                      ▼
-                                   │               │    ┌─────────────┐                    ┌──────────────┐
-                                   │               │    │Search missing│                    │ Evaluate fit │
-                                   │               │    │fields (DDG)  │                    │ (Gemini)     │
-                                   │               │    └──────┬──────┘                    └──────┬───────┘
-                                   │               │           │                                   │
-                                   │               │           └──────────► Parse specs ◄────────┘
-                                   │               │                      (loop, max 2 retries)
-                                   │               └──────────────────────────┤
-                                   │                                          ▼
-                                   │                                   ┌──────────────┐
-                                   │                                   │ Print specs  │
-                                   │                                   │ + fit result │
-                                   │                                   └──────┬───────┘
-                                   │                                          ▼
-                                   │                                   ┌──────────────┐
-                                   └──────────────────────────────────►│     End      │
-                                                                       └──────────────┘
-```
+
+The search loop runs at most **twice** (`retry_count` 0 → 1 → 2). After `parse_specs` on the scrape path, specs are written to cache before the retry decision. Cache hits **skip** Playwright, parsing, search, and save.
+
+### SQLite cache (cross-retailer aliasing)
+
+| Table | Purpose |
+|-------|---------|
+| `laptops` | One row per `slug_id` with hardware specs + `unknown_fields_json` |
+| `url_mapping` | Product page URL → `slug_id` |
+| `mpn_mapping` | Manufacturer part number / SKU → `slug_id` |
+
+`check_cache` resolves identity in order: **URL** → **MPN extracted from URL** → load **`laptops`** by `slug_id`. `save_to_cache` uses `INSERT OR REPLACE` on `laptops` and `INSERT OR IGNORE` on alias tables.
+
+Default database file: `data/laptop_cache.db` (gitignored). Delete this file if you change the schema and need a fresh empty database.
 
 ### Project layout
 
-| File | Role |
-|------|------|
-| `graph.py` | LangGraph workflow, CLI, streaming status |
+| File / directory | Role |
+|------------------|------|
+| `graph.py` | LangGraph nodes (`check_cache`, scrape, parse, `save_to_cache`, search, fit), CLI, streaming |
+| `mcp_client.py` | MCP SQLite session, schema init, cache read/write SQL |
+| `mpn.py` | Fast MPN/SKU extraction from product URLs |
 | `prompts/` | LLM prompt templates (`spec_extraction`, `use_case_fit`) |
-| `schema.py` | `LaptopSpecs` Pydantic model |
+| `schema.py` | `LaptopSpecs` and `UseCaseFitEvaluation` Pydantic models |
 | `state.py` | `AgentState` TypedDict |
 | `tools.py` | Async Playwright scrape + DuckDuckGo search tools |
 | `llm_config.py` | Gemini client + structured output |
 | `errors.py` | Typed errors and user-facing messages |
 | `logging_config.py` | Console + `logs/system.log` loggers |
+| `data/` | SQLite cache directory (`laptop_cache.db` created at runtime) |
 | `.env` | Secrets (not committed; see `.env.example`) |
 
 ### Tech stack
 
 - **Python 3.12+** (managed with [uv](https://github.com/astral-sh/uv))
-- **LangGraph** — stateful graph with conditional retry routing
+- **LangGraph** — stateful graph with cache routing and conditional search retries
+- **MCP** (`mcp` + `mcp-server-sqlite` via `uvx`) — SQLite cache over stdio
 - **Playwright** — async page rendering
 - **langchain-google-genai** — Gemini with `with_structured_output(LaptopSpecs)`
 - **langchain-community** — DuckDuckGo search (`DuckDuckGoSearchRun` / `ddgs`)
@@ -223,7 +190,14 @@ Successful runs print **laptop specs JSON** and a **fit evaluation** (recommenda
   "display_panel_type": "OLED",
   "tdp_watts": null,
   "gan_charging_support": true,
-  "refresh_rate_hz": 120
+  "refresh_rate_hz": 120,
+  "weight_kg": 1.12,
+  "screen_size_inches": 14.0,
+  "battery_capacity_wh": 57,
+  "operating_system": "Windows 11 Pro",
+  "gpu_type": "integrated",
+  "slug_id": "thinkpad-x1-carbon-gen-13",
+  "part_number_mpn": "21NXCTO1WWUS1"
 }
 ```
 
@@ -269,8 +243,13 @@ Environment variables (`.env` or shell):
 | `PLAYWRIGHT_TIMEOUT_MS` | No | `60000` | Page load timeout (ms) |
 | `PLAYWRIGHT_WAIT_UNTIL` | No | `domcontentloaded` | Playwright `wait_until` (`load`, `networkidle`, …) |
 | `LOG_LEVEL` | No | `DEBUG` | System log verbosity (`logs/system.log`) |
+| `SQLITE_DB_PATH` | No | `data/laptop_cache.db` | SQLite file for the spec cache |
+| `MCP_SQLITE_COMMAND` | No | `uvx` | Executable to launch the MCP SQLite server |
+| `MCP_SQLITE_ARGS` | No | `mcp-server-sqlite --db-path <db>` | Arguments for the MCP server (space-separated) |
 
-\*Required before the LLM parse step runs.
+\*Required before the LLM parse or fit-evaluation steps run.
+
+The cache needs **`uvx`** (or another way to run `mcp-server-sqlite`) on your PATH. If the MCP server cannot start, cache checks are skipped and the agent still scrapes normally.
 
 ### Playwright tips
 
@@ -281,9 +260,16 @@ PLAYWRIGHT_TIMEOUT_MS=90000
 PLAYWRIGHT_WAIT_UNTIL=load
 ```
 
+## How caching works
+
+1. **`check_cache`** — `SELECT slug_id FROM url_mapping WHERE url = ?`; on miss, extract MPN from the URL and query `mpn_mapping`; if a `slug_id` is found, `SELECT * FROM laptops` and set `state["specs"]`.
+2. **Cache hit** — graph routes directly to **`evaluate_use_case`** (no Playwright, no Gemini parse, no search).
+3. **Cache miss** — full scrape path; after each successful **`parse_specs`**, **`save_to_cache`** persists specs and aliases.
+4. **Second retailer** — same MPN or a new URL for the same `slug_id` hits the cache via `mpn_mapping` / `url_mapping`.
+
 ## How the retry loop works
 
-After each `parse_specs` node:
+After each `parse_specs` node (scrape path only; not re-run on cache hit):
 
 - `LaptopSpecs.unknown_fields` lists null schema fields.
 - If any are missing **and** `retry_count < 2`, the graph routes to `search_missing_specs`.
@@ -305,8 +291,8 @@ Log files are gitignored; the `logs/` directory is kept via `logs/.gitkeep`.
 
 The graph uses LangGraph `astream` with `stream_mode=["updates", "custom", "values"]`:
 
-- **custom** — fine-grained messages from nodes (`get_stream_writer`)
-- **updates** — node-level errors and parse summaries
+- **custom** — fine-grained messages from nodes (`get_stream_writer`), including cache hit/miss
+- **updates** — node-level errors, cache loads, parse summaries, fit results
 - **values** — full state snapshots for the final result
 
 `run_agent()` wraps `stream_agent()` and returns the final `AgentState`.
@@ -330,6 +316,8 @@ Common cases:
 | Quota / 429 | Rate limits | Wait, or use a lighter `GEMINI_MODEL` |
 | Playwright executable missing | Browser not installed | `uv run playwright install chromium` |
 | Partial JSON (null fields) | Specs not on page / search missed | Normal after max retries; check warnings |
+| Cache always misses | Empty DB or MCP server unavailable | First run populates cache; ensure `uvx` works; see `logs/system.log` |
+| Stale / wrong cached specs | Old row for same `slug_id` | Delete `data/laptop_cache.db` and re-run (schema changes require a fresh DB) |
 
 See `logs/system.log` for full stack traces.
 
@@ -352,7 +340,9 @@ uv run python graph.py --help
 |------|--------|
 | `tests/test_errors.py` | URL/use-case validation, exception mapping |
 | `tests/test_schema.py` | `LaptopSpecs.unknown_fields`, fit model |
-| `tests/test_graph.py` | Router, search queries, graph nodes, status helpers |
+| `tests/test_graph.py` | Routers, search queries, graph node names, status helpers |
+| `tests/test_mcp_client.py` | SQL literals, row mapping, insert SQL |
+| `tests/test_mpn.py` | MPN extraction from URLs |
 | `tests/test_prompts.py` | Prompt builder formatting |
 
 

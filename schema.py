@@ -1,6 +1,6 @@
 """Pydantic models for extracted laptop specs and use-case fit evaluation."""
 
-from typing import Literal, Optional
+from typing import ClassVar, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -48,6 +48,42 @@ class LaptopSpecs(BaseModel):
         default=None,
         description="Display refresh rate in Hz.",
     )
+    weight_kg: Optional[float] = Field(
+        default=None,
+        description="Laptop weight in kilograms.",
+    )
+    screen_size_inches: Optional[float] = Field(
+        default=None,
+        description="Diagonal screen size in inches.",
+    )
+    battery_capacity_wh: Optional[int] = Field(
+        default=None,
+        description="Battery capacity in watt-hours (Wh).",
+    )
+    operating_system: Optional[str] = Field(
+        default=None,
+        description="Preinstalled operating system (e.g. Windows 11 Home, macOS).",
+    )
+    gpu_type: Optional[Literal["dedicated", "integrated", "hybrid"]] = Field(
+        default=None,
+        description=(
+            "GPU class: dedicated discrete GPU, integrated only, or hybrid (switchable)."
+        ),
+    )
+    slug_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stable cross-retailer identity key (lowercase slug derived from model or MPN)."
+        ),
+    )
+    part_number_mpn: Optional[str] = Field(
+        default=None,
+        description="Manufacturer part number or SKU when stated on the page or URL.",
+    )
+
+    _CACHE_IDENTITY_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"slug_id", "part_number_mpn"},
+    )
 
     @property
     def unknown_fields(self) -> list[str]:
@@ -55,9 +91,13 @@ class LaptopSpecs(BaseModel):
 
         Returns:
             List of attribute names (e.g. ``npu_tops``) with value ``None``.
-            Empty when every field is populated.
+            Empty when every field is populated. Identity fields are excluded.
         """
-        return [name for name, value in self.model_dump().items() if value is None]
+        return [
+            name
+            for name, value in self.model_dump().items()
+            if value is None and name not in self._CACHE_IDENTITY_FIELDS
+        ]
 
 
 class UseCaseFitEvaluation(BaseModel):

@@ -15,3 +15,7 @@ wheels/
 # Runtime logs (directory kept via logs/.gitkeep)
 logs/*.log
 logs/*.log.*
+
+# SQLite cache (MCP server)
+data/*.db
+data/*.db-journal

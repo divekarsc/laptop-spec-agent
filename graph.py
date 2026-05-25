@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import os
+import re
 import sys
 from collections.abc import AsyncIterator
 from typing import Any, NotRequired, TypedDict
@@ -26,6 +27,14 @@ from errors import (
 from llm_config import get_fit_evaluation_llm, get_gemini_model_name, get_structured_llm
 from logging_config import get_system_logger, get_user_logger, setup_logging
 from prompts import build_extract_specs_prompt, build_fit_evaluation_prompt
+from mcp_client import (
+    fetch_laptop_by_slug,
+    lookup_slug_by_mpn,
+    lookup_slug_by_url,
+    mcp_sqlite_session,
+    save_laptop_cache,
+)
+from mpn import extract_mpn_from_url
 from schema import LaptopSpecs, UseCaseFitEvaluation
 from state import AgentState
 from tools import fetch_page_text, search_web
@@ -50,13 +59,20 @@ _FIELD_SEARCH_LABELS: dict[str, str] = {
     "tdp_watts": "TDP watts",
     "gan_charging_support": "GaN charging",
     "refresh_rate_hz": "refresh rate Hz",
+    "weight_kg": "weight kg",
+    "screen_size_inches": "screen size inches",
+    "battery_capacity_wh": "battery Wh",
+    "operating_system": "operating system",
+    "gpu_type": "GPU dedicated integrated",
 }
 
 _STREAM_MODES = ("updates", "custom", "values")
 
 _NODE_STATUS: dict[str, str] = {
+    "check_cache": "Checking spec cache…",
     "extract_page": "Scraping product page…",
     "parse_specs": "Parsing specs with Gemini…",
+    "save_to_cache": "Saving specs to cache…",
     "search_missing_specs": "Searching the web for missing specs…",
     "evaluate_use_case": "Evaluating fit for your use case…",
 }
@@ -150,6 +166,154 @@ def resolve_use_case(cli_value: str | None) -> str:
     if cli_value is not None:
         return validate_use_case(cli_value)
     return prompt_use_case_interactive()
+
+
+def _slugify_identity(value: str) -> str:
+    """Convert a model name or MPN into a stable lowercase slug id.
+
+    Args:
+        value: Raw identity string (model name, MPN, etc.).
+
+    Returns:
+        Slug with letters, digits, and hyphens (max 80 chars), or ``laptop-unknown``.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:80] if slug else "laptop-unknown"
+
+
+def _ensure_identity_fields(specs: LaptopSpecs, url: str) -> LaptopSpecs:
+    """Fill ``slug_id`` and ``part_number_mpn`` when Gemini or the URL provides hints.
+
+    Args:
+        specs: Structured output from Gemini (may omit identity fields).
+        url: Product page URL used for MPN extraction and slug fallback.
+
+    Returns:
+        Same instance or a copy with identity fields populated when inferable.
+    """
+    updates: dict[str, str] = {}
+    if not specs.part_number_mpn:
+        if mpn := extract_mpn_from_url(url):
+            updates["part_number_mpn"] = mpn
+    if not specs.slug_id:
+        base = specs.model_name or updates.get("part_number_mpn") or extract_mpn_from_url(url)
+        if base:
+            updates["slug_id"] = _slugify_identity(base)
+    if not updates:
+        return specs
+    return specs.model_copy(update=updates)
+
+
+async def check_cache_node(state: AgentState) -> dict:
+    """LangGraph node: resolve specs from SQLite via MCP (URL then MPN alias).
+
+    Lookup order: ``url_mapping`` by URL, then ``mpn_mapping`` using MPN from the
+    URL, then ``laptops`` by ``slug_id``. MCP failures are logged and treated as
+    a cache miss (empty partial update).
+
+    Args:
+        state: Requires ``state['url']``; skipped when ``error`` is already set.
+
+    Returns:
+        Partial update with ``specs`` on hit and cleared ``error``; empty dict on
+        miss or failure.
+    """
+    if state.get("error"):
+        system_log.debug("check_cache_node skipped: prior error=%s", state["error"])
+        return {}
+
+    url = state["url"]
+    _emit_status(_NODE_STATUS["check_cache"], node="check_cache", phase="cache")
+    user_log.info("Checking spec cache for URL.")
+    system_log.info("check_cache_node start url=%s", url)
+
+    try:
+        slug_id = await lookup_slug_by_url(url)
+        if not slug_id:
+            extracted_mpn = extract_mpn_from_url(url)
+            if extracted_mpn:
+                system_log.info(
+                    "check_cache_node url miss; trying mpn=%s",
+                    extracted_mpn,
+                )
+                slug_id = await lookup_slug_by_mpn(extracted_mpn)
+
+        if not slug_id:
+            _emit_status("Cache miss; scraping product page.", node="check_cache", phase="cache")
+            user_log.info("Cache miss for URL.")
+            system_log.info("check_cache_node miss url=%s", url)
+            return {}
+
+        specs = await fetch_laptop_by_slug(slug_id)
+        if not specs:
+            system_log.warning(
+                "check_cache_node slug=%s missing laptops row",
+                slug_id,
+            )
+            return {}
+
+        _emit_status(
+            f"Cache hit for {specs.model_name or slug_id}.",
+            node="check_cache",
+            phase="cache",
+        )
+        user_log.info("Cache hit: slug_id=%s", slug_id)
+        system_log.info("check_cache_node hit slug_id=%s", slug_id)
+        return {"specs": specs, "error": ""}
+    except Exception as exc:
+        system_log.warning("check_cache_node failed (continuing without cache): %s", exc)
+        return {}
+
+
+def route_after_check_cache(state: AgentState) -> str:
+    """Conditional edge after cache lookup: scrape or skip to fit evaluation.
+
+    Args:
+        state: Post-``check_cache`` state; may include ``specs`` on hit.
+
+    Returns:
+        ``"evaluate_use_case"`` when ``specs`` is set; otherwise ``"extract_page"``.
+    """
+    if state.get("specs"):
+        system_log.info("route_after_check_cache -> evaluate_use_case (cache hit)")
+        return "evaluate_use_case"
+    return "extract_page"
+
+
+async def save_to_cache_node(state: AgentState) -> dict:
+    """LangGraph node: persist specs and URL/MPN mappings to SQLite via MCP.
+
+    Runs after each successful ``parse_specs`` on the scrape path. Failures are
+    logged and do not set ``state['error']``.
+
+    Args:
+        state: Requires ``specs`` with ``slug_id`` and ``url``.
+
+    Returns:
+        Empty dict (cache writes are side effects only).
+    """
+    if state.get("error"):
+        system_log.debug("save_to_cache_node skipped: error=%s", state["error"])
+        return {}
+
+    specs = state.get("specs")
+    if not specs or not specs.slug_id:
+        system_log.debug("save_to_cache_node skipped: no slug_id")
+        return {}
+
+    url = state["url"]
+    _emit_status(_NODE_STATUS["save_to_cache"], node="save_to_cache", phase="cache")
+    user_log.info("Saving specs to cache (slug_id=%s).", specs.slug_id)
+    system_log.info("save_to_cache_node start slug_id=%s url=%s", specs.slug_id, url)
+
+    try:
+        await save_laptop_cache(url=url, specs=specs)
+        _emit_status("Specs saved to cache.", node="save_to_cache", phase="cache")
+        system_log.info("save_to_cache_node success slug_id=%s", specs.slug_id)
+        return {}
+    except Exception as exc:
+        system_log.warning("save_to_cache_node failed (non-fatal): %s", exc)
+        return {}
 
 
 def _format_search_query(model_name: str | None, field_name: str) -> str:
@@ -256,6 +420,7 @@ async def parse_specs_node(state: AgentState) -> dict:
                 ),
             ],
         )
+        specs = _ensure_identity_fields(specs, state["url"])
         unknown = specs.unknown_fields
         if unknown:
             _emit_status(
@@ -490,20 +655,35 @@ async def evaluate_use_case_node(state: AgentState) -> dict:
 
 
 def build_graph():
-    """Compile the laptop spec LangGraph with scrape, parse, search, and fit nodes.
+    """Compile the laptop spec LangGraph with cache, scrape, parse, search, and fit.
+
+    Flow: ``check_cache`` → (hit) ``evaluate_use_case`` | (miss) ``extract_page`` →
+    ``parse_specs`` → ``save_to_cache`` → search loop or ``evaluate_use_case``.
 
     Returns:
-        Compiled graph runnable via ``ainvoke`` / ``astream``.
+        Compiled graph runnable via ``ainvoke`` / ``astream``. Wrap runs in
+        ``mcp_sqlite_session()`` so cache nodes can reach SQLite.
     """
     workflow = StateGraph(AgentState)
+    workflow.add_node("check_cache", check_cache_node)
     workflow.add_node("extract_page", extract_page_node)
     workflow.add_node("parse_specs", parse_specs_node)
+    workflow.add_node("save_to_cache", save_to_cache_node)
     workflow.add_node("search_missing_specs", search_missing_specs_node)
     workflow.add_node("evaluate_use_case", evaluate_use_case_node)
-    workflow.add_edge(START, "extract_page")
-    workflow.add_edge("extract_page", "parse_specs")
+    workflow.add_edge(START, "check_cache")
     workflow.add_conditional_edges(
-        "parse_specs",
+        "check_cache",
+        route_after_check_cache,
+        {
+            "extract_page": "extract_page",
+            "evaluate_use_case": "evaluate_use_case",
+        },
+    )
+    workflow.add_edge("extract_page", "parse_specs")
+    workflow.add_edge("parse_specs", "save_to_cache")
+    workflow.add_conditional_edges(
+        "save_to_cache",
         route_after_parse,
         {
             "search_missing_specs": "search_missing_specs",
@@ -552,6 +732,15 @@ def _status_from_node_update(node: str, update: dict[str, Any] | None) -> AgentS
 
     if update.get("error"):
         return {"message": f"Error: {update['error']}", "node": node, "phase": "error"}
+
+    if node == "check_cache" and update.get("specs"):
+        specs = update["specs"]
+        if isinstance(specs, LaptopSpecs):
+            return {
+                "message": f"Loaded specs from cache ({specs.model_name or specs.slug_id}).",
+                "node": node,
+                "phase": "cache",
+            }
 
     if node == "parse_specs" and "specs" in update:
         specs = update["specs"]
@@ -620,27 +809,28 @@ async def stream_agent(url: str, use_case: str) -> AsyncIterator[AgentStatus]:
     system_log.info("stream_agent start url=%s use_case=%s", url, use_case)
 
     try:
-        async for mode, chunk in graph.astream(
-            _initial_state(url, use_case),
-            stream_mode=list(_STREAM_MODES),
-        ):
-            if mode == "values":
-                final_state = chunk
-                continue
+        async with mcp_sqlite_session():
+            async for mode, chunk in graph.astream(
+                _initial_state(url, use_case),
+                stream_mode=list(_STREAM_MODES),
+            ):
+                if mode == "values":
+                    final_state = chunk
+                    continue
 
-            if mode == "custom":
-                if status := _status_from_custom(chunk):
-                    _log_status(status)
-                    yield status
-                continue
-
-            if mode == "updates":
-                for node, update in chunk.items():
-                    if node.startswith("__"):
-                        continue
-                    if status := _status_from_node_update(node, update):
+                if mode == "custom":
+                    if status := _status_from_custom(chunk):
                         _log_status(status)
                         yield status
+                    continue
+
+                if mode == "updates":
+                    for node, update in chunk.items():
+                        if node.startswith("__"):
+                            continue
+                        if status := _status_from_node_update(node, update):
+                            _log_status(status)
+                            yield status
     except Exception as exc:
         message = error_message_for_state(exc, phase="graph")
         system_log.exception("stream_agent graph execution failed url=%s", url)

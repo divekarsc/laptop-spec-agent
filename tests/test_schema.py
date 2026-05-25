@@ -17,6 +17,11 @@ def test_unknown_fields_empty_when_complete() -> None:
         tdp_watts=28.0,
         gan_charging_support=True,
         refresh_rate_hz=120,
+        weight_kg=1.2,
+        screen_size_inches=14.0,
+        battery_capacity_wh=57,
+        operating_system="Windows 11",
+        gpu_type="integrated",
     )
     assert specs.unknown_fields == []
 
